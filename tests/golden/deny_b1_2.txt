@@ -1,0 +1,13 @@
+b1-2 has been idle 20 min and its cache has expired. Waking it re-stores its 157K-token conversation once, and every later turn re-reads all 157K.
+
+Decide which is cheaper:
+- **Resume** (re-send with [cold-resume-ok]) if the next task needs most of what this agent already read.
+- **Start fresh** if it needs only part of it. Rule of thumb: start fresh unless the task needs more than half of the old agent's context.
+
+If you start fresh, hand it this:
+- b1-2's closing summary (in its final message to you)
+- Report: /Users/dev/example-app/docs/step-2-report.md
+- Edited: /Users/dev/example-app/src/example_app/transcript.py, /Users/dev/example-app/tests/test_transcript.py, /Users/dev/example-app/docs/step-2-report.md
+- Read: /tmp/example/replays.py
+- Commits: d7cf145, 586dc55, edd8511
+- Last tests: $PY -m pytest tests/test_example.py -q -p no:randomly, 2 failed, 33 passed

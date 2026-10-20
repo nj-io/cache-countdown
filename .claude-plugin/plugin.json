@@ -1,0 +1,34 @@
+{
+  "name": "cache",
+  "version": "0.1.0",
+  "description": "Shows how long each subagent's prompt cache has left, and stops Claude waking a large agent whose cache has expired without weighing a fresh start.",
+  "author": { "name": "nj-io" },
+  "types": "./hooks/lib/state.d.ts",
+  "userConfig": {
+    "ttl_seconds": {
+      "type": "number",
+      "title": "Cache lifetime (seconds)",
+      "description": "Overrides the cache lifetime. Left empty, it is 3600 when subagentPromptCacheTtl is 1h and 300 otherwise.",
+      "min": 1
+    },
+    "min_tokens": {
+      "type": "number",
+      "title": "Guard threshold (tokens)",
+      "description": "The guard stops a message only to an agent holding at least this many tokens.",
+      "default": 50000,
+      "min": 0
+    },
+    "log_events": {
+      "type": "boolean",
+      "title": "Log guard decisions",
+      "description": "Appends one line per guard decision to ~/.claude/logs/cache/guard.jsonl.",
+      "default": false
+    },
+    "main_view": {
+      "type": "boolean",
+      "title": "Countdown in the main view",
+      "description": "Shows the agents whose cache is still alive above the prompt in the main conversation. Each agent's own view shows its countdown either way.",
+      "default": true
+    }
+  }
+}

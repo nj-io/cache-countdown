@@ -1,0 +1,14 @@
+{
+  "description": "cache: the countdown mod and the cold-wake guard on SendMessage",
+  "modules": ["./countdown.mjs"],
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "SendMessage",
+        "hooks": [
+          { "type": "command", "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/cold_wake_guard.py\"" }
+        ]
+      }
+    ]
+  }
+}

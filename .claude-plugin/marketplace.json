@@ -1,0 +1,14 @@
+{
+  "name": "cache-countdown",
+  "owner": {
+    "name": "nj-io"
+  },
+  "description": "The cache plugin: a prompt-cache countdown for Claude Code subagents and a guard against waking one whose cache has expired.",
+  "plugins": [
+    {
+      "name": "cache",
+      "source": "./",
+      "description": "Prompt-cache countdown for subagents and a guard against waking an agent whose cache has expired."
+    }
+  ]
+}

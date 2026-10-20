@@ -1,0 +1,12 @@
+pf-s1 has been idle 30 min and its cache has expired. Waking it re-stores its 315K-token conversation once, and every later turn re-reads all 315K.
+
+Decide which is cheaper:
+- **Resume** (re-send with [cold-resume-ok]) if the next task needs most of what this agent already read.
+- **Start fresh** if it needs only part of it. Rule of thumb: start fresh unless the task needs more than half of the old agent's context.
+
+If you start fresh, hand it this:
+- pf-s1's closing summary (in its final message to you)
+- Edited: /Users/dev/example-app/docs/step-1.md, /Users/dev/example-app/tests/test_workspace.py
+- Read: /tmp/example/notes.txt
+- Commits: d4cce294
+- Last tests: /Users/dev/.venvs/example/bin/python -m pytest tests/test_one.py tests/test_two.py -q -p no:cacheprovider, 1 failed, 37 passed, 17 errors
