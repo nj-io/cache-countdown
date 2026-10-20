@@ -1,6 +1,6 @@
 {
   "name": "cache",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Shows how long each subagent's prompt cache has left, and stops Claude waking a large agent whose cache has expired without weighing a fresh start.",
   "author": { "name": "nj-io" },
   "types": "./hooks/lib/state.d.ts",
@@ -35,6 +35,26 @@
       "title": "Main session cache lifetime (seconds)",
       "description": "Cache lifetime of the main session, in seconds. 3600 on a Max plan; 300 on the API without the 1-hour cache.",
       "default": 3600,
+      "min": 1
+    },
+    "keep_alive": {
+      "type": "boolean",
+      "title": "Keep the main session's cache alive",
+      "description": "Ping the main session before its cache expires, so coming back doesn't re-store the whole conversation.",
+      "default": false
+    },
+    "keep_alive_minutes": {
+      "type": "number",
+      "title": "Idle minutes before a ping",
+      "description": "Minutes the main session may sit idle before the ping.",
+      "default": 58,
+      "min": 1
+    },
+    "keep_alive_max": {
+      "type": "number",
+      "title": "Most pings in a row",
+      "description": "Pings in a row without input from you before it stops.",
+      "default": 3,
       "min": 1
     }
   }

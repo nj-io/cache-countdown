@@ -4,9 +4,10 @@ A Claude Code plugin that shows how long each subagent's prompt cache has left, 
 
 A subagent or teammate keeps its prompt cache for five minutes after its last request. Waking it later (a `SendMessage` to a finished agent) writes its whole conversation to the cache again at the cache-write price, which is much higher than the price of reading a warm cache. Every later turn then re-reads all of it. For an agent holding 150K tokens, a one-line follow-up after a coffee break costs as much as the original work, and a fresh agent given a short handoff often costs less.
 
-The plugin has two parts:
+The plugin has three parts:
 
 - **Countdown** (a mod): shows the time left on each agent's cache and on the main session's.
+- **Keep-alive** (a mod, off by default): pings the main session before its cache expires.
 - **Guard** (a `PreToolUse` hook on `SendMessage`): blocks one message to an idle agent whose cache has expired and that holds at least 50K tokens, and tells Claude what the choice costs.
 
 ## What you see
@@ -67,6 +68,20 @@ The guard lets a message through when:
 - the message went through the one-shot rule above or carries `[cold-resume-ok]`;
 - anything unexpected happens (an unreadable transcript, missing fields, no `python3`). The guard never blocks on an error.
 
+## Keep-alive
+
+A ping re-reads a warm cache at $0.20 per million tokens, while an expired 1-hour cache re-stores at $8 per million (2× the $4 input price), so for a 300K-token session a ping costs about $0.06 and coming back cold about $2.40 (Opus 5.5 rates).
+
+When `keep_alive` is on, the mod submits a short prompt to the main session once it has sat idle for `keep_alive_minutes`, while its cache is still alive. Each ping is a real turn: it appears in the scrollback as a message from the cache plugin, and the model answers `ok`. A ping goes out only when:
+
+- the main session is not working and no earlier ping is waiting to start;
+- the prompt box is empty, so a half-typed message is never in the way (a prompt box that cannot be read counts as not empty);
+- fewer than `keep_alive_max` pings have gone out since your last prompt. A prompt you type (terminal, Remote Control or Slack) starts the count over; task notifications, scheduled prompts, messages from other sessions or plugins and the plugin's own pings do not. After the last ping the cache lapses as usual and the row reads `main expired 12m`.
+
+While the count is above zero the main entry reads `cache  main 59:58 · kept alive 1/3 · reader 2:05`. A ping the engine refuses is not counted and is not retried before the next request of the main session.
+
+Turn it on with `/plugin configure cache@cache-countdown`, or `claude plugin configure cache@cache-countdown` from a shell, and set `keep_alive` to true.
+
 ## Install
 
 In Claude Code:
@@ -85,7 +100,7 @@ To try a local checkout:
 
 or load it for one session without installing: `claude --plugin-dir /path/to/cache-countdown` (the plugin id is then `cache@inline`).
 
-From a shell: `claude plugin marketplace add nj-io/cache-countdown` and `claude plugin install cache@cache-countdown`. Add `--scope project` to either to declare it in the current project's settings instead of your user settings. The installer prints "5 userConfig options not yet set"; all five are optional and have working defaults.
+From a shell: `claude plugin marketplace add nj-io/cache-countdown` and `claude plugin install cache@cache-countdown`. Add `--scope project` to either to declare it in the current project's settings instead of your user settings. The installer prints "8 userConfig options not yet set"; all eight are optional and have working defaults.
 
 ## Options
 
@@ -96,6 +111,9 @@ From a shell: `claude plugin marketplace add nj-io/cache-countdown` and `claude 
 | `log_events` | false | Appends one JSON line per guard decision to `<config dir>/logs/cache/guard.jsonl` (`~/.claude/logs/cache/guard.jsonl` by default). Fields: `ts`, `session`, `target`, `decision` (`pass`, `deny` or `override`), `reason`, `idle_s`, `tokens`. |
 | `main_view` | true | Shows the countdown row in the main view: the main session and the agents. `false` hides the whole row. |
 | `main_ttl_seconds` | 3600 | Cache lifetime of the main session, in seconds. 3600 on a Max plan; 300 on the API without the 1-hour cache. The plugin cannot read the plan, so set 300 there. |
+| `keep_alive` | false | Ping the main session before its cache expires, so coming back doesn't re-store the whole conversation. See Keep-alive. |
+| `keep_alive_minutes` | 58 | Minutes the main session may sit idle before the ping. At or above the main lifetime (`main_ttl_seconds`), the ping goes out a minute before the lifetime ends instead. Minimum 1. |
+| `keep_alive_max` | 3 | Pings in a row without input from you before it stops. Minimum 1. |
 
 The one-shot state is kept in `<config dir>/logs/cache/recent-denies.json` (written after every block, whether or not `log_events` is on); delete it to reset.
 
@@ -122,8 +140,9 @@ Set them in Claude Code with `/plugin configure cache@cache-countdown`, from a s
 
 ## Turn it off
 
-- `/plugin disable cache@cache-countdown` (or `claude plugin disable cache@cache-countdown`) turns off both parts. `claude plugin uninstall cache@cache-countdown` removes it.
+- `/plugin disable cache@cache-countdown` (or `claude plugin disable cache@cache-countdown`) turns off every part. `claude plugin uninstall cache@cache-countdown` removes it.
 - `main_view: false` hides the main row only, the main session's entry included.
+- `keep_alive: false` (the default) sends no pings.
 - A single message passes with `[cold-resume-ok]`.
 
 ## Known limits
@@ -135,6 +154,7 @@ Set them in Claude Code with `/plugin configure cache@cache-countdown`, from a s
 - **Only `SendMessage` is guarded.** Other ways of resuming an agent are not.
 - **It cannot change your cache settings.** `CLAUDE_CODE_SUBAGENT_MODEL` (which model subagents use) and `subagentPromptCacheTtl` (a one-hour cache lifetime) are yours to set; the plugin reads the latter and adjusts its thresholds.
 - **The main session's lifetime is set by hand.** The countdown cannot tell which cache lifetime the main session's plan gives it, so `main_ttl_seconds` holds the value (3600 by default).
+- **Keep-alive pings the main session only.** Subagents and teammates are not pinged.
 - The guard covers subagents and teammates, not the main session.
 
 ## Tests

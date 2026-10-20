@@ -6,11 +6,15 @@ export type CacheAgentTrack = { lastRequestAt: number; contextTokens: number; in
 /** One `$.agent.list()` row, as the countdown keeps it. */
 export type CacheRosterEntry = { name?: string; description?: string; status: string };
 
+/** Keep-alive pings sent since a person's last prompt, and whether the latest has yet to start its turn. */
+export type CacheKeepAlive = { pings: number; pending: boolean };
+
 declare module 'claude-code' {
   interface PluginState {
     cache: {
       agents: Record<string, CacheAgentTrack>;
       roster: Record<string, CacheRosterEntry>;
+      keepAlive: CacheKeepAlive;
     };
   }
 }

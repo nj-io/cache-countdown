@@ -12,9 +12,18 @@ import {
   clearInFlight,
   contextTokens,
   endRequest,
+  isPersonPrompt,
+  KEEP_ALIVE_INITIAL,
+  KEEP_ALIVE_TEXT,
+  keepAliveConfig,
+  keepAliveDue,
   MAIN_KEY,
+  mainRequestStarted,
   mainTtlSeconds,
   mainViewSegments,
+  personPrompted,
+  pingFailed,
+  pingSent,
   rosterFrom,
   sameRoster,
   shiftInFlight,
@@ -25,6 +34,8 @@ import {
 
 const agents = atom({ plugin: 'cache', key: 'agents' }, {});
 const roster = atom({ plugin: 'cache', key: 'roster' }, {});
+// Pings sent since a person's last prompt, and whether the latest has yet to start its turn.
+const keepAlive = atom({ plugin: 'cache', key: 'keepAlive' }, KEEP_ALIVE_INITIAL);
 
 const ROSTER_EVERY_TICKS = 5;
 // The setting is read again this often, so a change is picked up and a failed read is retried.
@@ -46,6 +57,8 @@ let lastDrew = false;
 let lastDrewMainView = false;
 // Whether the last tick that checked found something live; the tick that finds nothing redraws once more.
 let wasLive = false;
+// Set while a tick decides on a ping, so two ticks never send one each.
+let isPinging = false;
 // A reload forgets these, which costs one lookup at most.
 let lastRosterAt;
 const unlisted = new Set();
@@ -98,10 +111,41 @@ async function lookUpAgent($, id) {
   await refreshRoster($, id);
 }
 
+// Pings the main session when its cache is about to lapse. Never rejects: a failure is logged and the countdown goes on.
+async function keepMainAlive($, options, tracked) {
+  const mainTtlMs = mainTtlSeconds(options.main_ttl_seconds) * 1000;
+  const config = keepAliveConfig(options, mainTtlMs);
+  if (!config.isOn || isPinging || !tracked[MAIN_KEY]) return;
+  isPinging = true;
+  try {
+    const first = keepAliveDue(tracked, await read($, keepAlive), config, await $.clock.now(), mainTtlMs);
+    if (!first) return;
+    // A draft in the box is a person at work; a read that fails is no reason to risk typing over one.
+    const draft = await $.prompt.read();
+    if (typeof draft?.text !== 'string' || draft.text !== '') return;
+    // The turn may have started while the draft was read.
+    if (!keepAliveDue(await read($, agents), await read($, keepAlive), config, await $.clock.now(), mainTtlMs)) return;
+    await update($, keepAlive, pingSent);
+    try {
+      const sent = await $.prompt.submit({ text: KEEP_ALIVE_TEXT });
+      if (sent && sent.drop) throw new Error(`dropped: ${sent.drop}`);
+    } catch (err) {
+      quiet($, 'prompt.submit', err);
+      await update($, keepAlive, pingFailed);
+    }
+  } catch (err) {
+    quiet($, 'keep-alive', err);
+  } finally {
+    isPinging = false;
+  }
+}
+
 // One tick: with no agent tracked there is nothing to redraw or look up.
 async function onTick($, tick, options) {
   const tracked = await read($, agents);
   if (Object.keys(tracked).length === 0) return;
+  // Not awaited: the redraw below does not wait on the ping.
+  keepMainAlive($, options, tracked);
   if (!lastDrew || lastDrewMainView) {
     const now = await $.clock.now();
     const ttl = await cacheTtlMs($, options, now);
@@ -132,7 +176,9 @@ export const register = (on, options) => {
       ttlReadAt = undefined;
       lastRosterAt = undefined;
       wasLive = false;
+      isPinging = false;
       unlisted.clear();
+      await update($, keepAlive, () => KEEP_ALIVE_INITIAL);
       await update($, agents, clearInFlight);
       if (ticker) ticker.cancel();
       let tick = 0;
@@ -156,6 +202,8 @@ export const register = (on, options) => {
       const now = await $.clock.now();
       await update($, agents, all => startRequest(all, id, now));
       isCounted = true;
+      // The ping, if one was pending, has started its turn.
+      if (isMain && (await read($, keepAlive)).pending) await update($, keepAlive, mainRequestStarted);
     } catch (err) {
       quiet($, 'turn.step', err);
     }
@@ -178,6 +226,16 @@ export const register = (on, options) => {
     lookUpAgent($, id).catch(err => quiet($, 'agent.list', err));
     return result;
   });
+
+  // Observes only. A prompt the person sent starts the run of pings over; notifications, triggers, peers and other plugins do not.
+  on('prompt.submit', async ($, e, next) => {
+    try {
+      if (isPersonPrompt(e.origin) && (await read($, keepAlive)).pings > 0) await update($, keepAlive, personPrompted);
+    } catch (err) {
+      quiet($, 'prompt.submit', err);
+    }
+    return next(e);
+  }).catch(($, e, next) => next(e));
 
   on('tool.call', async ($, e, next) => {
     const id = e.agentId;
@@ -214,9 +272,12 @@ export const register = (on, options) => {
         const ttl = await cacheTtlMs($, options, now);
         const tracked = await read($, agents);
         const listed = await read($, roster);
+        const pings = (await read($, keepAlive)).pings;
+        const config = keepAliveConfig(options, mainTtlSeconds(options.main_ttl_seconds) * 1000);
+        const kept = config.isOn && pings > 0 ? { count: pings, max: config.max } : undefined;
         const segments = viewed
           ? viewedAgentSegments(tracked[viewed], now, ttl, listed[viewed]?.status)
-          : mainViewSegments(tracked, listed, now, ttl, undefined, mainTtlSeconds(options.main_ttl_seconds) * 1000);
+          : mainViewSegments(tracked, listed, now, ttl, undefined, mainTtlSeconds(options.main_ttl_seconds) * 1000, kept);
         if (segments) {
           isMainView = !viewed;
           const elements = $.ui.resolve(e);

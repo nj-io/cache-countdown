@@ -772,3 +772,243 @@ test('a state write that fails after the request leaves the stream and its end w
   expect(calls.steps).toBe(1)
   expect(logs.filter(l => l.startsWith('cache: turn.step: '))).toHaveLength(1)
 })
+
+// ---- keep-alive ping ----
+
+type Ping = { text: string; origin?: any }
+
+// Stubs the prompt box and prompt submission beneath the plugin. `submits` holds every
+// prompt that reached the engine; `box.text` is the draft; `box.readThrows` and
+// `box.submitThrows` make the read / the submit reject.
+function promptRig(on: any, opts: { text?: string } = {}) {
+  const submits: Ping[] = []
+  const box = { text: opts.text ?? '', readThrows: false, submitThrows: false }
+  on('prompt.read', () => {
+    if (box.readThrows) throw new Error('read unavailable')
+    return { value: { text: box.text, cursor: box.text.length } }
+  })
+  on('prompt.submit', (_$: any, e: any) => {
+    if (box.submitThrows) throw new Error('submit refused')
+    submits.push({ text: e.text, origin: e.origin })
+    return { text: e.text, origin: e.origin }
+  })
+  return { submits, box }
+}
+
+const PING = 'Keep-alive ping from the cache mod. Reply with only: ok'
+const pings = (submits: Ping[]) => submits.filter(s => s.text === PING)
+// A prompt as the engine raises it for a person typing at the terminal / for this plugin's own ping.
+const person = { wait: false, origin: { kind: 'composer' } }
+const own = { wait: false, origin: { kind: 'plugin', name: 'cache' } }
+// Short lifetimes keep the mocked clock's steps few: a 300 s main cache, a ping after 1 minute.
+const SHORT = { main_ttl_seconds: 300, keep_alive: true, keep_alive_minutes: 1 }
+
+test('keep-alive: pings at the idle threshold and not before', { options: SHORT, ...SLOW }, async ($, on) => {
+  const { clock } = rig(on)
+  const { submits } = promptRig(on)
+  await $.session.start(START)
+  await request($, clock)
+  await clock.set(59_000)
+  expect(pings(submits)).toHaveLength(0)
+  await clock.set(60_000)
+  expect(pings(submits)).toHaveLength(1)
+})
+
+test('keep-alive: off by default', { options: { main_ttl_seconds: 300 }, ...SLOW }, async ($, on) => {
+  const { clock } = rig(on)
+  const { submits } = promptRig(on)
+  await $.session.start(START)
+  await request($, clock)
+  await clock.set(200_000)
+  expect(submits).toHaveLength(0)
+})
+
+test('keep-alive: not while the main session is working', { options: SHORT, ...SLOW }, async ($, on) => {
+  const { clock } = rig(on, { responseMs: 100_000 })
+  const { submits } = promptRig(on)
+  await $.session.start(START)
+  const done = step($)
+  await clock.set(90_000)
+  expect(pings(submits)).toHaveLength(0)
+  await clock.set(100_000)
+  await done
+  // The request ended at 100 s and began at 0 s: the cache is 100 s old, past the threshold.
+  await clock.advance(2_000)
+  expect(pings(submits)).toHaveLength(1)
+})
+
+test('keep-alive: not with a draft in the prompt box, and then once it is empty', { options: SHORT, ...SLOW }, async ($, on) => {
+  const { clock } = rig(on)
+  const { submits, box } = promptRig(on, { text: 'half a sentence' })
+  await $.session.start(START)
+  await request($, clock)
+  await clock.set(70_000)
+  expect(pings(submits)).toHaveLength(0)
+  box.text = ''
+  await clock.advance(2_000)
+  expect(pings(submits)).toHaveLength(1)
+})
+
+test('keep-alive: a prompt box read that rejects sends nothing and leaves the row drawing', { options: SHORT, ...SLOW }, async ($, on) => {
+  const { clock, logs } = rig(on)
+  const { submits, box } = promptRig(on)
+  box.readThrows = true
+  await $.session.start(START)
+  await request($, clock)
+  await clock.set(70_000)
+  expect(pings(submits)).toHaveLength(0)
+  expect(logs.some(l => l.startsWith('cache: keep-alive: '))).toBe(true)
+  expect(textOf(cacheRow(await (await mount($)).drawn()))).toBe('cache  main 3:50')
+})
+
+test('keep-alive: stops at the maximum in a row', { options: { ...SHORT, keep_alive_max: 2 }, ...SLOWER }, async ($, on) => {
+  const { clock } = rig(on)
+  const { submits } = promptRig(on)
+  await $.session.start(START)
+  await request($, clock)
+  for (const at of [60_000, 120_000]) {
+    await clock.set(at)
+    // The ping's own turn.
+    await request($, clock)
+  }
+  expect(pings(submits)).toHaveLength(2)
+  await clock.set(180_000)
+  await clock.set(240_000)
+  expect(pings(submits)).toHaveLength(2)
+  expect(textOf(cacheRow(await (await mount($)).drawn()))).toBe('cache  main 3:00 · kept alive 2/2')
+})
+
+test('keep-alive: no second ping while the first has not started its turn', { options: SHORT, ...SLOW }, async ($, on) => {
+  const { clock } = rig(on)
+  const { submits } = promptRig(on)
+  await $.session.start(START)
+  await request($, clock)
+  await clock.set(60_000)
+  await clock.set(100_000)
+  await clock.set(200_000)
+  expect(pings(submits)).toHaveLength(1)
+})
+
+test('keep-alive: a person\'s prompt resets the count, the plugin\'s own does not', { options: SHORT, ...SLOW }, async ($, on) => {
+  const { clock } = rig(on)
+  promptRig(on)
+  await $.session.start(START)
+  await request($, clock)
+  await clock.set(60_000)
+  await request($, clock)
+  const ui = await mount($)
+  expect(textOf(cacheRow(await ui.drawn()))).toBe('cache  main 5:00 · kept alive 1/3')
+  await $.prompt.submit({ text: 'ping', ...own })
+  await ui.redraw()
+  expect(textOf(cacheRow(await ui.drawn()))).toBe('cache  main 5:00 · kept alive 1/3')
+  await $.prompt.submit({ text: 'hello', ...person })
+  await ui.redraw()
+  expect(textOf(cacheRow(await ui.drawn()))).toBe('cache  main 5:00')
+})
+
+// Two pings in, a prompt of this origin is submitted and the row redrawn.
+async function twoPingsThenPrompt($: any, on: any, origin: any) {
+  const { clock } = rig(on)
+  const { submits } = promptRig(on)
+  await $.session.start(START)
+  await request($, clock)
+  for (const at of [60_000, 120_000]) {
+    await clock.set(at)
+    // The ping's own turn.
+    await request($, clock)
+  }
+  const ui = await mount($)
+  expect(textOf(cacheRow(await ui.drawn()))).toBe('cache  main 5:00 · kept alive 2/3')
+  await $.prompt.submit({ text: 'x', wait: false, origin })
+  await ui.redraw()
+  return { clock, submits, ui }
+}
+
+// The third ping still goes out and a fourth does not.
+for (const origin of [
+  { kind: 'task-notification' },
+  { kind: 'scheduled-trigger' },
+  { kind: 'peer' },
+  { kind: 'unclassified' },
+  { kind: 'plugin', name: 'other' },
+  { kind: 'sdk' },
+]) {
+  test(`keep-alive: a ${origin.kind} prompt${'name' in origin ? ` (${origin.name})` : ''} does not reset the count, so pings still stop at the maximum`, { options: SHORT, ...SLOWER }, async ($, on) => {
+    const { clock, submits, ui } = await twoPingsThenPrompt($, on, origin)
+    expect(textOf(cacheRow(await ui.drawn()))).toBe('cache  main 5:00 · kept alive 2/3')
+    await clock.set(180_000)
+    await request($, clock)
+    expect(pings(submits)).toHaveLength(3)
+    await clock.set(240_000)
+    await clock.set(300_000)
+    expect(pings(submits)).toHaveLength(3)
+  })
+}
+
+for (const kind of ['composer', 'bridge', 'slack-ping']) {
+  test(`keep-alive: a ${kind} prompt resets the count`, { options: SHORT, ...SLOWER }, async ($, on) => {
+    const { ui } = await twoPingsThenPrompt($, on, { kind })
+    expect(textOf(cacheRow(await ui.drawn()))).toBe('cache  main 5:00')
+  })
+}
+
+test('keep-alive: the idle threshold stays under the main lifetime', { options: { main_ttl_seconds: 120, keep_alive: true, keep_alive_minutes: 5 }, ...SLOW }, async ($, on) => {
+  const { clock } = rig(on)
+  const { submits } = promptRig(on)
+  await $.session.start(START)
+  await request($, clock)
+  await clock.set(59_000)
+  expect(pings(submits)).toHaveLength(0)
+  await clock.set(60_000)
+  expect(pings(submits)).toHaveLength(1)
+})
+
+test('keep-alive: the row reads the pings after the clock, and an expired main reads as usual', { options: { keep_alive: true, keep_alive_max: 1 }, ...SLOWER }, async ($, on) => {
+  const { clock } = rig(on)
+  const { submits } = promptRig(on)
+  await $.session.start(START)
+  await request($, clock)
+  await clock.set(58 * 60_000)
+  expect(pings(submits)).toHaveLength(1)
+  await request($, clock)
+  await clock.set(58 * 60_000 + 2_000)
+  const ui = await mount($)
+  expect(textOf(cacheRow(await ui.drawn()))).toBe('cache  main 59:58 · kept alive 1/1')
+  // At the maximum no further ping goes out; the cache lapses an hour after the last request.
+  await clock.set(58 * 60_000 + 3_600_000 + 12 * 60_000)
+  await ui.redraw()
+  expect(pings(submits)).toHaveLength(1)
+  expect(textOf(cacheRow(await ui.drawn()))).toBe('cache  main expired 12m')
+})
+
+test('keep-alive: a rejected submit leaves the countdown drawing, is not counted and is not retried', { options: SHORT, ...SLOW }, async ($, on) => {
+  const { clock, logs } = rig(on)
+  const { submits, box } = promptRig(on)
+  box.submitThrows = true
+  await $.session.start(START)
+  await request($, clock)
+  await clock.set(70_000)
+  await clock.set(120_000)
+  expect(submits).toHaveLength(0)
+  expect(logs.filter(l => l.startsWith('cache: prompt.submit: '))).toHaveLength(1)
+  expect(textOf(cacheRow(await (await mount($)).drawn()))).toBe('cache  main 3:00')
+  // The next main request clears the stop: the ping goes out again once the stub accepts it.
+  box.submitThrows = false
+  await request($, clock)
+  await clock.set(190_000)
+  expect(pings(submits)).toHaveLength(1)
+})
+
+test('keep-alive: session.start starts the count over', { options: SHORT, ...SLOW }, async ($, on) => {
+  const { clock } = rig(on)
+  promptRig(on)
+  await $.session.start(START)
+  await request($, clock)
+  await clock.set(60_000)
+  await request($, clock)
+  const ui = await mount($)
+  expect(textOf(cacheRow(await ui.drawn()))).toContain('kept alive 1/3')
+  await $.session.start(START)
+  await ui.redraw()
+  expect(textOf(cacheRow(await ui.drawn()))).toBe('cache  main 5:00')
+})

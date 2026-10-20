@@ -9,9 +9,16 @@ import {
   formatAgo,
   formatClock,
   formatTokens,
+  isPersonPrompt,
+  keepAliveConfig,
+  keepAliveDue,
+  mainRequestStarted,
   mainTtlSeconds,
   mainViewEntries,
   mainViewSegments,
+  personPrompted,
+  pingFailed,
+  pingSent,
   prune,
   rosterFrom,
   sameRoster,
@@ -296,4 +303,117 @@ test('prune keeps the main track however old', async () => {
   const agents = { main: idleTrack(0), old: idleTrack(0) }
   expect(Object.keys(prune(agents, 3 * day))).toEqual(['main'])
   expect(Object.keys(startRequest(agents, 'a1', 3 * day)).sort()).toEqual(['a1', 'main'])
+})
+
+// ---- keep-alive ping ----
+
+const ON = { keep_alive: true, keep_alive_minutes: 58, keep_alive_max: 3 }
+const NONE = { pings: 0, pending: false }
+
+test('keepAliveConfig: the options, with the defaults for anything missing or out of range', async () => {
+  expect(keepAliveConfig(ON, MAIN_TTL)).toEqual({ isOn: true, idleMs: 58 * 60_000, max: 3 })
+  expect(keepAliveConfig({}, MAIN_TTL)).toEqual({ isOn: false, idleMs: 58 * 60_000, max: 3 })
+  expect(keepAliveConfig({ keep_alive: false }, MAIN_TTL).isOn).toBe(false)
+  expect(keepAliveConfig({ keep_alive: true, keep_alive_minutes: 0, keep_alive_max: 0 }, MAIN_TTL)).toMatchObject({ idleMs: 58 * 60_000, max: 3 })
+  expect(keepAliveConfig({ keep_alive: true, keep_alive_minutes: 10, keep_alive_max: 5 }, MAIN_TTL)).toMatchObject({ idleMs: 600_000, max: 5 })
+})
+
+test('keepAliveConfig: an idle time at or over the main lifetime becomes the lifetime less a minute, never below 0', async () => {
+  expect(keepAliveConfig({ ...ON, keep_alive_minutes: 58 }, 3_000_000).idleMs).toBe(2_940_000)
+  expect(keepAliveConfig({ ...ON, keep_alive_minutes: 60 }, MAIN_TTL).idleMs).toBe(MAIN_TTL - 60_000)
+  expect(keepAliveConfig({ ...ON, keep_alive_minutes: 59 }, MAIN_TTL).idleMs).toBe(59 * 60_000)
+  expect(keepAliveConfig({ ...ON, keep_alive_minutes: 5 }, 300_000).idleMs).toBe(240_000)
+  expect(keepAliveConfig({ ...ON, keep_alive_minutes: 1 }, 30_000).idleMs).toBe(0)
+})
+
+test('keepAliveDue: at the idle threshold and not a millisecond before', async () => {
+  const cfg = keepAliveConfig(ON, MAIN_TTL)
+  const agents = { main: idleTrack(1000) }
+  expect(keepAliveDue(agents, NONE, cfg, 1000 + 58 * 60_000 - 1, MAIN_TTL)).toBe(false)
+  expect(keepAliveDue(agents, NONE, cfg, 1000 + 58 * 60_000, MAIN_TTL)).toBe(true)
+})
+
+test('keepAliveDue: not when the option is off, nothing is tracked, or the cache has expired', async () => {
+  const agents = { main: idleTrack(0) }
+  const at = 58 * 60_000
+  expect(keepAliveDue(agents, NONE, keepAliveConfig({ ...ON, keep_alive: false }, MAIN_TTL), at, MAIN_TTL)).toBe(false)
+  expect(keepAliveDue({}, NONE, keepAliveConfig(ON, MAIN_TTL), at, MAIN_TTL)).toBe(false)
+  expect(keepAliveDue({ a1: idleTrack(0) }, NONE, keepAliveConfig(ON, MAIN_TTL), at, MAIN_TTL)).toBe(false)
+  expect(keepAliveDue({ main: idleTrack(NaN) }, NONE, keepAliveConfig(ON, MAIN_TTL), at, MAIN_TTL)).toBe(false)
+  expect(keepAliveDue(agents, NONE, keepAliveConfig(ON, MAIN_TTL), MAIN_TTL - 1, MAIN_TTL)).toBe(true)
+  expect(keepAliveDue(agents, NONE, keepAliveConfig(ON, MAIN_TTL), MAIN_TTL, MAIN_TTL)).toBe(false)
+})
+
+test('keepAliveDue: not while the main session is working', async () => {
+  // A tool call began a second ago on a request that is otherwise old enough to ping after.
+  const busy = { main: { ...idleTrack(0), inFlight: 1, workingSince: 58 * 60_000 - 1000 } }
+  expect(keepAliveDue({ main: idleTrack(0) }, NONE, keepAliveConfig(ON, MAIN_TTL), 58 * 60_000, MAIN_TTL)).toBe(true)
+  expect(keepAliveDue(busy, NONE, keepAliveConfig(ON, MAIN_TTL), 58 * 60_000, MAIN_TTL)).toBe(false)
+})
+
+test('keepAliveDue: not at the maximum in a row, nor while a ping is pending', async () => {
+  const agents = { main: idleTrack(0) }
+  const cfg = keepAliveConfig(ON, MAIN_TTL)
+  const at = 58 * 60_000
+  expect(keepAliveDue(agents, { pings: 2, pending: false }, cfg, at, MAIN_TTL)).toBe(true)
+  expect(keepAliveDue(agents, { pings: 3, pending: false }, cfg, at, MAIN_TTL)).toBe(false)
+  expect(keepAliveDue(agents, { pings: 0, pending: true }, cfg, at, MAIN_TTL)).toBe(false)
+})
+
+test('keepAliveDue: a clamped threshold still waits for the cache to be idle that long', async () => {
+  const cfg = keepAliveConfig({ ...ON, keep_alive_minutes: 5 }, 300_000)
+  const agents = { main: idleTrack(0) }
+  expect(keepAliveDue(agents, NONE, cfg, 239_999, 300_000)).toBe(false)
+  expect(keepAliveDue(agents, NONE, cfg, 240_000, 300_000)).toBe(true)
+})
+
+test('isPersonPrompt: only the composer, the bridge and a Slack ping, over every PromptOrigin kind', async () => {
+  const people = ['composer', 'bridge', 'slack-ping']
+  const others = [
+    'sdk',
+    'task-notification',
+    'scheduled-trigger',
+    'peer',
+    'peer-send-message',
+    'projects-relay',
+    'channel',
+    'coordinator',
+    'observer',
+    'observer-activity',
+    'auto-continuation',
+    'unclassified',
+    'plugin',
+  ]
+  for (const kind of people) expect(isPersonPrompt({ kind })).toBe(true)
+  for (const kind of others) expect(isPersonPrompt({ kind })).toBe(false)
+  expect(isPersonPrompt({ kind: 'plugin', name: 'cache' })).toBe(false)
+  expect(isPersonPrompt({ kind: 'plugin', name: 'other', asUser: true })).toBe(false)
+  expect(isPersonPrompt({ kind: 'channel', server: 'slack' })).toBe(false)
+  expect(isPersonPrompt(undefined)).toBe(false)
+})
+
+test('keep-alive state: a ping counts and waits, a refused one is not counted, a main request ends the wait, a person resets the count', async () => {
+  const sent = pingSent(NONE)
+  expect(sent).toEqual({ pings: 1, pending: true })
+  expect(pingFailed(sent)).toEqual({ pings: 0, pending: true })
+  expect(pingFailed(NONE)).toEqual({ pings: 0, pending: true })
+  expect(mainRequestStarted(sent)).toEqual({ pings: 1, pending: false })
+  expect(mainRequestStarted(NONE)).toBe(NONE)
+  expect(personPrompted({ pings: 2, pending: true })).toEqual({ pings: 0, pending: true })
+  expect(personPrompted(NONE)).toBe(NONE)
+})
+
+test('mainViewSegments: a kept-alive main reads its pings after the clock', async () => {
+  const kept = { count: 1, max: 3 }
+  const roster = { a1: { name: 'reader', status: 'idle' } }
+  const segments = mainViewSegments({ main: idleTrack(2000) }, {}, 4000, 300_000, 3, MAIN_TTL, kept)
+  expect(rowText(segments)).toBe('cache  main 59:58 · kept alive 1/3')
+  expect(segments[1]).toEqual({ text: 'main 59:58 · kept alive 1/3', tone: 'dim' })
+  expect(rowText(mainViewSegments({ main: idleTrack(0), a1: idleTrack(125_000) }, { a1: roster.a1 }, 180_000, 300_000, 3, MAIN_TTL, kept))).toBe('cache  main 57:00 · kept alive 1/3 · reader 4:05')
+  expect(rowText(mainViewSegments({ main: idleTrack(2000) }, {}, 4000, 300_000, 3, MAIN_TTL, { count: 0, max: 3 }))).toBe('cache  main 59:58')
+  expect(rowText(mainViewSegments({ main: idleTrack(2000) }, {}, 4000, 300_000, 3, MAIN_TTL))).toBe('cache  main 59:58')
+})
+
+test('mainViewSegments: an expired main shows its age without the pings', async () => {
+  expect(rowText(mainViewSegments({ main: idleTrack(0) }, {}, 3_600_000 + 12 * 60_000, 300_000, 3, MAIN_TTL, { count: 3, max: 3 }))).toBe('cache  main expired 12m')
 })

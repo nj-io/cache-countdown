@@ -7,6 +7,14 @@ export const MAIN_VIEW_CAP = 3;
 // The state key of the main session's own track; agent ids never take this value.
 export const MAIN_KEY = 'main';
 export const DEFAULT_MAIN_TTL_S = 3600;
+// Origins the person types or sends themselves; everything else (notifications, triggers, peers, channels, other plugins) is not a person.
+export const PERSON_ORIGINS = ['composer', 'bridge', 'slack-ping'];
+export const DEFAULT_KEEP_ALIVE_MINUTES = 58;
+export const DEFAULT_KEEP_ALIVE_MAX = 3;
+// When the idle threshold would reach the main lifetime, it sits this far under it.
+export const KEEP_ALIVE_MARGIN_MS = 60_000;
+export const KEEP_ALIVE_TEXT = 'Keep-alive ping from the cache mod. Reply with only: ok';
+export const KEEP_ALIVE_INITIAL = { pings: 0, pending: false };
 // Remaining time at or under this draws in the warning color.
 export const WARN_MS = 60_000;
 // Tracks idle longer than this are dropped from state (engine forks leave one per prompt).
@@ -149,14 +157,18 @@ export function mainViewEntries(agents, roster, now, ttlMs, cap = MAIN_VIEW_CAP)
 }
 
 /**
- * The main session's entry for the row: its clock while its cache is alive,
- * its age once expired; undefined while it is working or was never seen.
+ * The main session's entry for the row: its clock while its cache is alive
+ * (with ` · kept alive N/M` after it when `keptAlive` has pings), its age once
+ * expired; undefined while it is working or was never seen.
  */
-export function mainSessionSegment(agents, now, mainTtlMs) {
+export function mainSessionSegment(agents, now, mainTtlMs, keptAlive) {
   const track = agents[MAIN_KEY];
   if (!track || !Number.isFinite(track.lastRequestAt)) return undefined;
   const status = cacheStatus(track, now, mainTtlMs);
-  if (status.kind === 'alive') return { text: `main ${formatClock(status.remainingMs)}`, tone: toneFor(status.remainingMs) };
+  if (status.kind === 'alive') {
+    const kept = keptAlive && keptAlive.count > 0 ? ` · kept alive ${keptAlive.count}/${keptAlive.max}` : '';
+    return { text: `main ${formatClock(status.remainingMs)}${kept}`, tone: toneFor(status.remainingMs) };
+  }
   if (status.kind === 'expired') return { text: `main expired ${compactAge(status.expiredForMs)}`, tone: 'expired' };
   return undefined;
 }
@@ -166,9 +178,9 @@ export function mainSessionSegment(agents, now, mainTtlMs) {
  * Text props: the main session first (outside `cap` and the `+N more` count),
  * then the agents. Undefined when neither the main session nor an agent qualifies.
  */
-export function mainViewSegments(agents, roster, now, ttlMs, cap = MAIN_VIEW_CAP, mainTtlMs = DEFAULT_MAIN_TTL_S * 1000) {
+export function mainViewSegments(agents, roster, now, ttlMs, cap = MAIN_VIEW_CAP, mainTtlMs = DEFAULT_MAIN_TTL_S * 1000, keptAlive) {
   const { shown, more } = mainViewEntries(agents, roster, now, ttlMs, cap);
-  const main = mainSessionSegment(agents, now, mainTtlMs);
+  const main = mainSessionSegment(agents, now, mainTtlMs, keptAlive);
   if (shown.length === 0 && !main) return undefined;
   const segments = [{ text: 'cache  ', tone: 'dim' }];
   if (main) segments.push(main);
@@ -178,6 +190,65 @@ export function mainViewSegments(agents, roster, now, ttlMs, cap = MAIN_VIEW_CAP
   });
   if (more > 0) segments.push({ text: ` · +${more} more`, tone: 'dim' });
   return segments;
+}
+
+// ---- keep-alive ping for the main session ----
+
+/**
+ * The keep-alive options as the decision reads them: whether it is on, the
+ * idle time before a ping in ms, and the pings allowed in a row. The idle
+ * time stays under the main lifetime: at or over it, it is the lifetime less
+ * a minute (never below 0).
+ */
+export function keepAliveConfig(options, mainTtlMs) {
+  const isOn = options?.keep_alive === true || options?.keep_alive === 'true';
+  const minutes = options?.keep_alive_minutes;
+  const max = options?.keep_alive_max;
+  const wantedMs = (Number.isFinite(minutes) && minutes >= 1 ? minutes : DEFAULT_KEEP_ALIVE_MINUTES) * 60_000;
+  return {
+    isOn,
+    idleMs: wantedMs >= mainTtlMs ? Math.max(0, mainTtlMs - KEEP_ALIVE_MARGIN_MS) : wantedMs,
+    max: Number.isFinite(max) && max >= 1 ? Math.floor(max) : DEFAULT_KEEP_ALIVE_MAX,
+  };
+}
+
+/**
+ * Whether the main session is due a ping at `now`: the option on, its track
+ * idle at least the configured time yet still alive and not working, fewer than
+ * `max` pings since a person's prompt, and none pending. The prompt box's
+ * draft is the caller's to check.
+ */
+export function keepAliveDue(agents, state, config, now, mainTtlMs) {
+  if (!config.isOn || state.pending || state.pings >= config.max) return false;
+  const track = agents[MAIN_KEY];
+  if (!track || !Number.isFinite(track.lastRequestAt)) return false;
+  if (cacheStatus(track, now, mainTtlMs).kind !== 'alive') return false;
+  return now - track.lastRequestAt >= config.idleMs;
+}
+
+/** Whether a `prompt.submit` origin is a prompt the person sent: the terminal, Remote Control or Slack. */
+export function isPersonPrompt(origin) {
+  return PERSON_ORIGINS.includes(origin?.kind);
+}
+
+/** State after a ping goes out: one more in a row, pending until the main session's next request. */
+export function pingSent(state) {
+  return { pings: state.pings + 1, pending: true };
+}
+
+/** State after a ping was refused: not counted, and none follows before the main session's next request. */
+export function pingFailed(state) {
+  return { pings: Math.max(0, state.pings - 1), pending: true };
+}
+
+/** State after a main request starts: the ping, if one was pending, has landed. */
+export function mainRequestStarted(state) {
+  return state.pending ? { ...state, pending: false } : state;
+}
+
+/** State after a prompt the person sent: the run of pings starts over. */
+export function personPrompted(state) {
+  return state.pings === 0 ? state : { ...state, pings: 0 };
 }
 
 /** The row for one agent's own view; undefined when the agent is not tracked. */
