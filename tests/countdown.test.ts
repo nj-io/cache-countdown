@@ -75,9 +75,9 @@ function rig(
   return { clock, logs, calls, setting }
 }
 
-// Starts one model request for `agentId` and reads its stream to the end.
-function step($: any, agentId: string): Promise<unknown> {
-  const stream = $.turn.step({ turnId: `t-${agentId}`, index: 0, model: 'm', messageCount: 1, agentId })
+// Starts one model request for `agentId` (the main loop's when none) and reads its stream to the end.
+function step($: any, agentId?: string): Promise<unknown> {
+  const stream = $.turn.step({ turnId: `t-${agentId ?? 'main'}`, index: 0, model: 'm', messageCount: 1, ...(agentId ? { agentId } : {}) })
   return (async () => {
     for await (const _ of stream) {
       // forwarded chunks are not under test
@@ -87,7 +87,7 @@ function step($: any, agentId: string): Promise<unknown> {
 }
 
 // A request at the clock's current time that answers at once.
-async function request($: any, clock: MockClock, agentId: string) {
+async function request($: any, clock: MockClock, agentId?: string) {
   const done = step($, agentId)
   await clock.settle()
   await done
@@ -576,19 +576,187 @@ test('a survey on screen leaves only the other mods\' output', async ($, on) => 
   expect(textOf(await (await mount($, { agentId: 'arev-1' }, { hasSurvey: true })).drawn())).toBe('BELOW')
 })
 
-test('a request or tool call with no agent id is not tracked', { plugins: [agentWrites] }, async ($, on) => {
+test('a tool call with no agent id is not tracked', { plugins: [agentWrites] }, async ($, on) => {
   const { clock, logs } = rig(on, { agents: [] })
-  const stream = $.turn.step({ turnId: 't-main', index: 0, model: 'm', messageCount: 1 })
-  const drained = (async () => {
-    for await (const _ of stream) {
-      // forwarded chunks are not under test
-    }
-  })()
   const call = $.tool.call({ tool: 'Bash', command: 'x' } as any)
   await clock.settle()
-  await drained
   await call
   expect(logged(logs, 'write agents')).toBe(0)
+})
+
+test('a request with no agent id is the main session\'s: tracked, never looked up', { plugins: [agentWrites] }, async ($, on) => {
+  const { clock, logs, calls } = rig(on, { agents: [] })
+  await request($, clock)
+  await clock.settle()
+  // One write when the request starts, one when it ends.
+  expect(logged(logs, 'write agents')).toBe(2)
+  expect(calls.list).toBe(0)
+})
+
+// ---- the main session's own countdown ----
+
+test('main: the row shows main with its clock, and nothing else when no agent qualifies', SLOW, async ($, on) => {
+  const { clock } = rig(on, { agents: [] })
+  await request($, clock)
+  // The default lifetime is an hour, whatever subagentPromptCacheTtl says.
+  await clock.set(775_000)
+  const ui = await mount($)
+  const row = cacheRow(await ui.drawn())
+  expect(textOf(row)).toBe('cache  main 47:05')
+  expect(row.children[1]).toMatchObject({ props: { dimColor: true }, children: ['main 47:05'] })
+  await clock.set(3_550_000)
+  await ui.redraw()
+  expect(cacheRow(await ui.drawn()).children[1]).toMatchObject({ props: { color: 'warning' }, children: ['main 0:50'] })
+})
+
+test('main: leads the agents in the row', SLOWER, async ($, on) => {
+  const { clock } = rig(on, {
+    agents: [{ id: 'arev-1', name: 'rev-ui' }, { id: 'ard-1', name: 'reader' }, { id: 'afix-1', name: 'fix-db' }, { id: 'aoth-1', name: 'other' }],
+  })
+  await request($, clock)
+  for (const [at, id] of [[516_000, 'arev-1'], [600_000, 'ard-1'], [667_000, 'afix-1'], [700_000, 'aoth-1']] as const) {
+    await clock.set(at)
+    await request($, clock, id)
+  }
+  await clock.set(775_000)
+  const ui = await mount($)
+  expect(textOf(cacheRow(await ui.drawn()))).toBe('cache  main 47:05 · rev-ui 0:41 · reader 2:05 · fix-db 3:12 · +1 more')
+})
+
+test('main: an expired main shows its age beside the live agents', { options: { main_ttl_seconds: 300 }, ...SLOW }, async ($, on) => {
+  const { clock } = rig(on, { agents: [{ id: 'ard-1', name: 'reader' }] })
+  await request($, clock)
+  await clock.set(875_000)
+  await request($, clock, 'ard-1')
+  await clock.set(1_050_000)
+  const ui = await mount($)
+  const row = cacheRow(await ui.drawn())
+  expect(textOf(row)).toBe('cache  main expired 12m · reader 2:05')
+  expect(row.children[1]).toMatchObject({ props: { color: 'error' }, children: ['main expired 12m'] })
+})
+
+test('main: outside the cap of three and the +N more count', SLOWER, async ($, on) => {
+  const names = ['w1', 'w2', 'w3', 'w4', 'e1', 'e2', 'alpha', 'bravo', 'charlie', 'delta']
+  const { clock } = rig(on, { agents: names.map(n => ({ id: `a${n}-1`, name: n })), toolMs: 30_000 })
+  // Two agents whose cache runs out at 300 s, then at 400 s main and eight more.
+  await request($, clock, 'ae1-1')
+  await request($, clock, 'ae2-1')
+  await clock.set(400_000)
+  await request($, clock)
+  for (const n of ['w1', 'w2', 'w3', 'w4', 'alpha', 'bravo', 'charlie', 'delta']) await request($, clock, `a${n}-1`)
+  const calls = ['w1', 'w2', 'w3', 'w4'].map(n => $.tool.call({ tool: 'Bash', command: 'x', agentId: `a${n}-1` } as any))
+  await clock.settle()
+  const ui = await mount($)
+  expect(textOf(cacheRow(await ui.drawn()))).toBe('cache  main 1:00:00 · alpha 5:00 · bravo 5:00 · charlie 5:00 · +1 more')
+  await clock.advance(30_000)
+  await Promise.all(calls)
+})
+
+test('main: a main request in flight leaves main out of the row', SLOW, async ($, on) => {
+  const { clock } = rig(on, { agents: [{ id: 'aidle-1', name: 'idle' }], responseMs: 5_000 })
+  const first = step($, 'aidle-1')
+  await clock.advance(5_000)
+  await first
+  const done = step($)
+  await clock.settle()
+  const ui = await mount($)
+  expect(textOf(cacheRow(await ui.drawn()))).toBe('cache  idle 4:55')
+  await clock.advance(5_000)
+  await done
+  await ui.redraw()
+  expect(textOf(cacheRow(await ui.drawn()))).toBe('cache  main 59:55 · idle 4:50')
+})
+
+test('main: never seen, and working with no agents, draw no row', SLOW, async ($, on) => {
+  const { clock } = rig(on, { agents: [], responseMs: 5_000 })
+  const ui = await mount($)
+  expect(textOf(await ui.drawn())).toBe('BELOW')
+  const done = step($)
+  await clock.settle()
+  await ui.redraw()
+  expect(textOf(await ui.drawn())).toBe('BELOW')
+  await clock.advance(5_000)
+  await done
+  await ui.redraw()
+  expect(textOf(cacheRow(await ui.drawn()))).toBe('cache  main 59:55')
+})
+
+test('main: main_ttl_seconds sets its lifetime and leaves the agents\' alone', { options: { main_ttl_seconds: 60 }, ...SLOW }, async ($, on) => {
+  const { clock } = rig(on, { agents: [{ id: 'arev-1', name: 'rev' }], ttl: '1h' })
+  await request($, clock)
+  await request($, clock, 'arev-1')
+  await clock.set(40_000)
+  const ui = await mount($)
+  expect(textOf(cacheRow(await ui.drawn()))).toBe('cache  main 0:20 · rev 59:20')
+  await clock.set(70_000)
+  await ui.redraw()
+  expect(textOf(cacheRow(await ui.drawn()))).toBe('cache  main expired 0m · rev 58:50')
+})
+
+test('main: main_view off hides the whole row, main included', { options: { main_view: false }, plugins: [agentWrites] }, async ($, on) => {
+  const { clock, logs } = rig(on, { agents: [{ id: 'arev-1', name: 'rev' }] })
+  await request($, clock)
+  await request($, clock, 'arev-1')
+  // Main is tracked all the same: its request wrote the tracks twice, the agent's twice more.
+  expect(logged(logs, 'write agents')).toBe(4)
+  expect(textOf(await (await mount($)).drawn())).toBe('BELOW')
+  expect(textOf(cacheRow(await (await mount($, { agentId: 'arev-1' })).drawn()))).toBe('cache 5:00 left · 84K')
+})
+
+test('main: an agent view does not show main', { plugins: [agentWrites] }, async ($, on) => {
+  const { clock, logs } = rig(on, { agents: [{ id: 'arev-1', name: 'rev' }] })
+  await request($, clock)
+  await request($, clock, 'arev-1')
+  expect(textOf(cacheRow(await (await mount($)).drawn()))).toBe('cache  main 1:00:00 · rev 5:00')
+  expect(textOf(cacheRow(await (await mount($, { agentId: 'arev-1' })).drawn()))).toBe('cache 5:00 left · 84K')
+})
+
+test('main: the clock ticks with no subagents', { plugins: [invalidations], ...SLOWER }, async ($, on) => {
+  const { clock, logs } = rig(on, { agents: [] })
+  await $.session.start(START)
+  await request($, clock)
+  await clock.advance(3_000)
+  expect(logged(logs, 'invalidate')).toBeGreaterThan(0)
+})
+
+test('main: an expired main row redraws once a minute, and its age advances', { plugins: [invalidations], options: { main_ttl_seconds: 60 }, ...SLOWER }, async ($, on) => {
+  const { clock, logs } = rig(on, { agents: [] })
+  await $.session.start(START)
+  await request($, clock)
+  await clock.advance(70_000)
+  const ui = await mount($)
+  expect(textOf(cacheRow(await ui.drawn()))).toBe('cache  main expired 0m')
+  const before = logged(logs, 'invalidate')
+  await clock.advance(120_000)
+  const redraws = logged(logs, 'invalidate') - before
+  expect(redraws).toBeGreaterThan(0)
+  expect(redraws).toBeLessThanOrEqual(2)
+  expect(textOf(cacheRow(await ui.drawn()))).toBe('cache  main expired 2m')
+})
+
+test('main: the tick that finds main no longer live redraws the row at once', { options: { main_ttl_seconds: 60 }, ...SLOWER }, async ($, on) => {
+  const { clock } = rig(on, { agents: [] })
+  await $.session.start(START)
+  await clock.set(10_000)
+  await request($, clock)
+  await clock.set(55_000)
+  const ui = await mount($)
+  expect(textOf(cacheRow(await ui.drawn()))).toBe('cache  main 0:15')
+  await clock.advance(17_000)
+  expect(textOf(cacheRow(await ui.drawn()))).toBe('cache  main expired 0m')
+})
+
+test('main: the tick that finds an agent no longer live drops it from the row at once', { options: { main_ttl_seconds: 60 }, ...SLOWER }, async ($, on) => {
+  const { clock } = rig(on, { agents: [{ id: 'arev-1', name: 'rev' }] })
+  await $.session.start(START)
+  await request($, clock)
+  await clock.set(10_000)
+  await request($, clock, 'arev-1')
+  await clock.set(305_000)
+  const ui = await mount($)
+  expect(textOf(cacheRow(await ui.drawn()))).toContain('rev 0:05')
+  await clock.advance(7_000)
+  expect(textOf(cacheRow(await ui.drawn()))).not.toContain('rev')
 })
 
 test('a state write that fails before the request leaves the stream working', { plugins: [firstAgentWriteFails] }, async ($, on) => {

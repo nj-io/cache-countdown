@@ -1,6 +1,6 @@
 {
   "name": "cache",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Shows how long each subagent's prompt cache has left, and stops Claude waking a large agent whose cache has expired without weighing a fresh start.",
   "author": { "name": "nj-io" },
   "types": "./hooks/lib/state.d.ts",
@@ -27,8 +27,15 @@
     "main_view": {
       "type": "boolean",
       "title": "Countdown in the main view",
-      "description": "Shows the agents whose cache is still alive above the prompt in the main conversation. Each agent's own view shows its countdown either way.",
+      "description": "Shows the main session's cache and the agents whose cache is still alive above the prompt in the main conversation. Each agent's own view shows its countdown either way.",
       "default": true
+    },
+    "main_ttl_seconds": {
+      "type": "number",
+      "title": "Main session cache lifetime (seconds)",
+      "description": "Cache lifetime of the main session, in seconds. 3600 on a Max plan; 300 on the API without the 1-hour cache.",
+      "default": 3600,
+      "min": 1
     }
   }
 }

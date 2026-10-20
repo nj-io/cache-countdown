@@ -4,6 +4,9 @@
 export const DEFAULT_TTL_S = 300;
 export const LONG_TTL_S = 3600;
 export const MAIN_VIEW_CAP = 3;
+// The state key of the main session's own track; agent ids never take this value.
+export const MAIN_KEY = 'main';
+export const DEFAULT_MAIN_TTL_S = 3600;
 // Remaining time at or under this draws in the warning color.
 export const WARN_MS = 60_000;
 // Tracks idle longer than this are dropped from state (engine forks leave one per prompt).
@@ -20,6 +23,12 @@ const STORED_DESCRIPTION_CHARS = 64;
 export function ttlSeconds(settingValue, optionValue) {
   if (typeof optionValue === 'number' && Number.isFinite(optionValue) && optionValue > 0) return optionValue;
   return settingValue === '1h' ? LONG_TTL_S : DEFAULT_TTL_S;
+}
+
+/** The main session's cache lifetime in seconds: the `main_ttl_seconds` option when it is a positive number, else 3600. */
+export function mainTtlSeconds(optionValue) {
+  if (typeof optionValue === 'number' && Number.isFinite(optionValue) && optionValue > 0) return optionValue;
+  return DEFAULT_MAIN_TTL_S;
 }
 
 /** Context size of one request: everything the model read, cached or not. */
@@ -53,6 +62,14 @@ export function formatAgo(ms) {
   if (min < 60) return `${min} min ago`;
   const rest = min % 60;
   return rest === 0 ? `${Math.floor(min / 60)} h ago` : `${Math.floor(min / 60)} h ${rest} min ago`;
+}
+
+/** A whole-unit age for the main row: `12m` under 60 min, `3h` under 48 h, else `2d`; `0m` under a minute. */
+export function compactAge(ms) {
+  const min = Math.floor(Math.max(0, ms) / 60_000);
+  if (min < 60) return `${min}m`;
+  const hours = Math.floor(min / 60);
+  return hours < 48 ? `${hours}h` : `${Math.floor(hours / 24)}d`;
 }
 
 /** An agent's label: its name from `$.agent.list()`, else its description cut short, else a short id. */
@@ -94,9 +111,17 @@ export function cacheStatus(track, now, ttlMs, rosterStatus) {
     : { kind: 'expired', expiredForMs: now - expiresAt };
 }
 
-/** Whether any track is working or has cache left at `now`; when none does, only an expired line can still be on screen. */
-export function anyLive(agents, roster, now, ttlMs) {
-  return Object.entries(agents).some(([id, track]) => Number.isFinite(track.lastRequestAt) && cacheStatus(track, now, ttlMs, roster[id]?.status).kind !== 'expired');
+/**
+ * Whether any track is working or has cache left at `now`; when none does,
+ * only an expired line can still be on screen. The main session's track runs
+ * on `mainTtlMs`, the agents' on `ttlMs`.
+ */
+export function anyLive(agents, roster, now, ttlMs, mainTtlMs = DEFAULT_MAIN_TTL_S * 1000) {
+  return Object.entries(agents).some(([id, track]) => {
+    if (!Number.isFinite(track.lastRequestAt)) return false;
+    const isMain = id === MAIN_KEY;
+    return cacheStatus(track, now, isMain ? mainTtlMs : ttlMs, isMain ? undefined : roster[id]?.status).kind !== 'expired';
+  });
 }
 
 export function toneFor(remainingMs) {
@@ -112,6 +137,7 @@ export function toneFor(remainingMs) {
 export function mainViewEntries(agents, roster, now, ttlMs, cap = MAIN_VIEW_CAP) {
   const alive = [];
   for (const [id, track] of Object.entries(agents)) {
+    if (id === MAIN_KEY) continue;
     const listed = roster[id];
     if (!listed || listed.status === 'killed') continue;
     const status = cacheStatus(track, now, ttlMs, listed.status);
@@ -123,15 +149,31 @@ export function mainViewEntries(agents, roster, now, ttlMs, cap = MAIN_VIEW_CAP)
 }
 
 /**
- * The main view's row as text segments, each with a tone the hook maps to
- * Text props; undefined when no agent qualifies.
+ * The main session's entry for the row: its clock while its cache is alive,
+ * its age once expired; undefined while it is working or was never seen.
  */
-export function mainViewSegments(agents, roster, now, ttlMs, cap = MAIN_VIEW_CAP) {
+export function mainSessionSegment(agents, now, mainTtlMs) {
+  const track = agents[MAIN_KEY];
+  if (!track || !Number.isFinite(track.lastRequestAt)) return undefined;
+  const status = cacheStatus(track, now, mainTtlMs);
+  if (status.kind === 'alive') return { text: `main ${formatClock(status.remainingMs)}`, tone: toneFor(status.remainingMs) };
+  if (status.kind === 'expired') return { text: `main expired ${compactAge(status.expiredForMs)}`, tone: 'expired' };
+  return undefined;
+}
+
+/**
+ * The main view's row as text segments, each with a tone the hook maps to
+ * Text props: the main session first (outside `cap` and the `+N more` count),
+ * then the agents. Undefined when neither the main session nor an agent qualifies.
+ */
+export function mainViewSegments(agents, roster, now, ttlMs, cap = MAIN_VIEW_CAP, mainTtlMs = DEFAULT_MAIN_TTL_S * 1000) {
   const { shown, more } = mainViewEntries(agents, roster, now, ttlMs, cap);
-  if (shown.length === 0) return undefined;
+  const main = mainSessionSegment(agents, now, mainTtlMs);
+  if (shown.length === 0 && !main) return undefined;
   const segments = [{ text: 'cache  ', tone: 'dim' }];
+  if (main) segments.push(main);
   shown.forEach((entry, i) => {
-    if (i > 0) segments.push({ text: ' · ', tone: 'dim' });
+    if (main || i > 0) segments.push({ text: ' · ', tone: 'dim' });
     segments.push({ text: `${entry.label} ${formatClock(entry.remainingMs)}`, tone: toneFor(entry.remainingMs) });
   });
   if (more > 0) segments.push({ text: ` · +${more} more`, tone: 'dim' });
@@ -195,7 +237,8 @@ export function clearInFlight(agents) {
 export function prune(agents, now, keepMs = PRUNE_AFTER_MS) {
   const out = {};
   for (const [id, track] of Object.entries(agents)) {
-    if (track.inFlight > 0 || now - track.lastRequestAt <= keepMs) out[id] = track;
+    // The main session is one track for the whole session; its age reads on the row however old.
+    if (id === MAIN_KEY || track.inFlight > 0 || now - track.lastRequestAt <= keepMs) out[id] = track;
   }
   return out;
 }

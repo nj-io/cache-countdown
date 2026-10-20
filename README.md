@@ -6,18 +6,22 @@ A subagent or teammate keeps its prompt cache for five minutes after its last re
 
 The plugin has two parts:
 
-- **Countdown** (a mod): shows the time left on each agent's cache.
+- **Countdown** (a mod): shows the time left on each agent's cache and on the main session's.
 - **Guard** (a `PreToolUse` hook on `SendMessage`): blocks one message to an idle agent whose cache has expired and that holds at least 50K tokens, and tells Claude what the choice costs.
 
 ## What you see
 
 The countdown is a row above the prompt.
 
-In the main view it lists the agents whose cache is still alive, soonest expiry first, at most three, then a count of the rest:
+In the main view the row starts with the main session's own cache, then lists the agents whose cache is still alive, soonest expiry first, at most three, then a count of the rest. The main entry sits outside the limit of three and outside the count:
 
 ```
- cache  reviewer-auth 0:48 · builder-auth 3:12 · +2 more
+ cache  main 47:05 · rev-ui 0:41 · reader 2:05 · fix-db 3:12 · +1 more
+ cache  main expired 12m · reader 2:05
+ cache  main 47:05
 ```
+
+The main entry shows the time left on the main session's cache, from its latest model request, and turns amber at a minute or less. Once the cache has expired it reads `main expired 12m` in the error color, the age in whole units: minutes under an hour, hours under 48 hours, then days (`0m` under a minute). The entry is left out while the main session is inside a model request and before its first request. The row appears when the main session or any agent qualifies. Its lifetime is the `main_ttl_seconds` option, 3600 s unless set; it is separate from `ttl_seconds`, which applies to agents.
 
 In an agent's own view (open it from the footer agent list) it shows that agent's state and context size:
 
@@ -27,7 +31,7 @@ In an agent's own view (open it from the footer agent list) it shows that agent'
  cache working · 1:12 left · 47K
 ```
 
-Alive countdowns are dim, switch to the theme's warning color at a minute or less, and the expired row uses the error color. An agent that is inside a model request or a tool call shows as `working` in its own view (with the time left when the cache is still alive) and is left out of the main row. A label is the agent's name, else the first 16 characters of its description, else the start of its id; agents that share a label get `#` and four characters of their id (`builder#3f9a`). Times left show as `m:ss`, or `h:mm:ss` from an hour; the time since expiry shows as seconds, minutes, or, from an hour, hours and minutes (`2 h 10 min ago`). The guard's deny text reads in minutes up to 120 min, then hours up to 48 h, then days. A `working` agent whose cache has already expired shows `cache working · expired 2 min ago · 47K`. The main row can be turned off (see Options); each agent's own view always shows its countdown.
+Alive countdowns are dim, switch to the theme's warning color at a minute or less, and the expired row uses the error color. An agent that is inside a model request or a tool call shows as `working` in its own view (with the time left when the cache is still alive) and is left out of the main row. A label is the agent's name, else the first 16 characters of its description, else the start of its id; agents that share a label get `#` and four characters of their id (`builder#3f9a`). Times left show as `m:ss`, or `h:mm:ss` from an hour; the time since expiry shows as seconds, minutes, or, from an hour, hours and minutes (`2 h 10 min ago`). The guard's deny text reads in minutes up to 120 min, then hours up to 48 h, then days. A `working` agent whose cache has already expired shows `cache working · expired 2 min ago · 47K`. The main row, the main entry included, can be turned off (see Options); each agent's own view always shows its countdown.
 
 ## What the guard does
 
@@ -81,7 +85,7 @@ To try a local checkout:
 
 or load it for one session without installing: `claude --plugin-dir /path/to/cache-countdown` (the plugin id is then `cache@inline`).
 
-From a shell: `claude plugin marketplace add nj-io/cache-countdown` and `claude plugin install cache@cache-countdown`. Add `--scope project` to either to declare it in the current project's settings instead of your user settings. The installer prints "4 userConfig options not yet set"; all four are optional and have working defaults.
+From a shell: `claude plugin marketplace add nj-io/cache-countdown` and `claude plugin install cache@cache-countdown`. Add `--scope project` to either to declare it in the current project's settings instead of your user settings. The installer prints "5 userConfig options not yet set"; all five are optional and have working defaults.
 
 ## Options
 
@@ -90,7 +94,8 @@ From a shell: `claude plugin marketplace add nj-io/cache-countdown` and `claude 
 | `ttl_seconds` | unset | Cache lifetime in seconds. Empty: the guard uses `subagentPromptCacheTtl` from user, project, local and managed settings (`1h` gives 3600 s, anything else 300 s). A lifetime set with `--settings` is not visible to the guard, so set `ttl_seconds` explicitly in that case. |
 | `min_tokens` | 50000 | The guard stops a message only to an agent holding at least this many tokens. May be 0, which guards every agent with recorded usage. An invalid value falls back to the default. |
 | `log_events` | false | Appends one JSON line per guard decision to `<config dir>/logs/cache/guard.jsonl` (`~/.claude/logs/cache/guard.jsonl` by default). Fields: `ts`, `session`, `target`, `decision` (`pass`, `deny` or `override`), `reason`, `idle_s`, `tokens`. |
-| `main_view` | true | Shows the countdown row in the main view. |
+| `main_view` | true | Shows the countdown row in the main view: the main session and the agents. `false` hides the whole row. |
+| `main_ttl_seconds` | 3600 | Cache lifetime of the main session, in seconds. 3600 on a Max plan; 300 on the API without the 1-hour cache. The plugin cannot read the plan, so set 300 there. |
 
 The one-shot state is kept in `<config dir>/logs/cache/recent-denies.json` (written after every block, whether or not `log_events` is on); delete it to reset.
 
@@ -118,7 +123,7 @@ Set them in Claude Code with `/plugin configure cache@cache-countdown`, from a s
 ## Turn it off
 
 - `/plugin disable cache@cache-countdown` (or `claude plugin disable cache@cache-countdown`) turns off both parts. `claude plugin uninstall cache@cache-countdown` removes it.
-- `main_view: false` hides the main row only.
+- `main_view: false` hides the main row only, the main session's entry included.
 - A single message passes with `[cold-resume-ok]`.
 
 ## Known limits
@@ -129,7 +134,8 @@ Set them in Claude Code with `/plugin configure cache@cache-countdown`, from a s
 - **Only in-process teammates and subagents are guarded and counted.** Teammates in tmux or iTerm pane mode run as separate sessions and pass. Addresses containing `@`, `:` or a space pass as peer addresses.
 - **Only `SendMessage` is guarded.** Other ways of resuming an agent are not.
 - **It cannot change your cache settings.** `CLAUDE_CODE_SUBAGENT_MODEL` (which model subagents use) and `subagentPromptCacheTtl` (a one-hour cache lifetime) are yours to set; the plugin reads the latter and adjusts its thresholds.
-- The countdown tracks subagents and teammates, not the main session.
+- **The main session's lifetime is set by hand.** The countdown cannot tell which cache lifetime the main session's plan gives it, so `main_ttl_seconds` holds the value (3600 by default).
+- The guard covers subagents and teammates, not the main session.
 
 ## Tests
 

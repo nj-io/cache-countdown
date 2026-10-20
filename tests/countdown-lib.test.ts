@@ -4,11 +4,14 @@ import {
   anyLive,
   cacheStatus,
   clearInFlight,
+  compactAge,
   endRequest,
   formatAgo,
   formatClock,
   formatTokens,
+  mainTtlSeconds,
   mainViewEntries,
+  mainViewSegments,
   prune,
   rosterFrom,
   sameRoster,
@@ -183,4 +186,114 @@ test('anyLive: true for an alive or working track, false when every track is exp
   expect(anyLive({ a1: idle, a2: busy }, {}, 450_000, 300_000)).toBe(true)
   expect(anyLive({ a1: { ...idle, lastRequestAt: NaN } }, {}, 1000, 300_000)).toBe(false)
   expect(anyLive({}, {}, 0, 300_000)).toBe(false)
+})
+
+// ---- the main session's own entry ----
+
+const MAIN_TTL = 3_600_000
+const HOUR = 3_600_000
+const idleTrack = (lastRequestAt: number) => ({ lastRequestAt, contextTokens: 1, inFlight: 0 })
+const rowText = (segments: any) => segments?.map((s: any) => s.text).join('')
+
+test('compactAge: whole minutes under an hour, hours under 48 h, then days, floored', async () => {
+  expect(compactAge(0)).toBe('0m')
+  expect(compactAge(59_999)).toBe('0m')
+  expect(compactAge(12 * 60_000 + 59_000)).toBe('12m')
+  expect(compactAge(59 * 60_000 + 59_000)).toBe('59m')
+  expect(compactAge(HOUR)).toBe('1h')
+  expect(compactAge(3 * HOUR + 59 * 60_000)).toBe('3h')
+  expect(compactAge(48 * HOUR - 1)).toBe('47h')
+  expect(compactAge(48 * HOUR)).toBe('2d')
+  expect(compactAge(5 * 24 * HOUR + 23 * HOUR)).toBe('5d')
+  expect(compactAge(-5)).toBe('0m')
+})
+
+test('mainTtlSeconds: the option when positive, else 3600', async () => {
+  expect(mainTtlSeconds(undefined)).toBe(3600)
+  expect(mainTtlSeconds(300)).toBe(300)
+  expect(mainTtlSeconds(0)).toBe(3600)
+  expect(mainTtlSeconds(NaN)).toBe(3600)
+  expect(mainTtlSeconds('300' as any)).toBe(3600)
+})
+
+test('mainViewSegments: the main session leads the row with its clock', async () => {
+  // Requests at 0 (main), 516 s, 600 s, 667 s and 700 s; now is 775 s.
+  const agents = { main: idleTrack(0), a1: idleTrack(516_000), a2: idleTrack(600_000), a3: idleTrack(667_000), a4: idleTrack(700_000) }
+  const roster = { a1: { name: 'rev-ui', status: 'idle' }, a2: { name: 'reader', status: 'idle' }, a3: { name: 'fix-db', status: 'idle' }, a4: { name: 'other', status: 'idle' } }
+  const segments = mainViewSegments(agents, roster, 775_000, 300_000, 3, MAIN_TTL)
+  expect(rowText(segments)).toBe('cache  main 47:05 · rev-ui 0:41 · reader 2:05 · fix-db 3:12 · +1 more')
+  expect(segments[1]).toEqual({ text: 'main 47:05', tone: 'dim' })
+  expect(rowText(mainViewSegments({ main: idleTrack(0) }, {}, 775_000, 300_000, 3, MAIN_TTL))).toBe('cache  main 47:05')
+})
+
+test('mainViewSegments: main turns amber in its last minute', async () => {
+  expect(mainViewSegments({ main: idleTrack(0) }, {}, MAIN_TTL - 60_000, 300_000, 3, MAIN_TTL)[1]).toEqual({ text: 'main 1:00', tone: 'warn' })
+  expect(mainViewSegments({ main: idleTrack(0) }, {}, MAIN_TTL - 60_001, 300_000, 3, MAIN_TTL)[1].tone).toBe('dim')
+})
+
+test('mainViewSegments: an expired main shows its age in the expired tone', async () => {
+  // Main expired at 300 s on a 300 s lifetime; now is 1050 s, 12.5 minutes later.
+  const agents = { main: idleTrack(0), a2: idleTrack(875_000) }
+  const roster = { a2: { name: 'reader', status: 'idle' } }
+  const segments = mainViewSegments(agents, roster, 1_050_000, 300_000, 3, 300_000)
+  expect(rowText(segments)).toBe('cache  main expired 12m · reader 2:05')
+  expect(segments[1]).toEqual({ text: 'main expired 12m', tone: 'expired' })
+  expect(rowText(mainViewSegments({ main: idleTrack(0) }, {}, 1_050_000, 300_000, 3, 300_000))).toBe('cache  main expired 12m')
+})
+
+test('mainViewSegments: main sits outside the cap and the +N more count', async () => {
+  const roster: Record<string, any> = {}
+  const agents: Record<string, any> = { main: idleTrack(400_000) }
+  // Four working, two expired, four alive; the alive four are a-alpha..a-delta.
+  for (const n of ['w1', 'w2', 'w3', 'w4']) {
+    agents[n] = { ...idleTrack(400_000), inFlight: 1, workingSince: 400_000 }
+    roster[n] = { name: n, status: 'running' }
+  }
+  for (const n of ['e1', 'e2']) {
+    agents[n] = idleTrack(0)
+    roster[n] = { name: n, status: 'idle' }
+  }
+  for (const n of ['alpha', 'bravo', 'charlie', 'delta']) {
+    agents[n] = idleTrack(400_000)
+    roster[n] = { name: n, status: 'idle' }
+  }
+  expect(rowText(mainViewSegments(agents, roster, 400_000, 300_000, 3, MAIN_TTL))).toBe('cache  main 1:00:00 · alpha 5:00 · bravo 5:00 · charlie 5:00 · +1 more')
+})
+
+test('mainViewSegments: a working or never-seen main has no entry', async () => {
+  const roster = { a1: { name: 'reader', status: 'idle' } }
+  expect(rowText(mainViewSegments({ main: idleTrack(0), a1: idleTrack(0) }, roster, 100_000, 300_000, 3, MAIN_TTL))).toBe('cache  main 58:20 · reader 3:20')
+  const busy = { main: { ...idleTrack(0), inFlight: 1, workingSince: 0 }, a1: idleTrack(0) }
+  expect(rowText(mainViewSegments(busy, roster, 100_000, 300_000, 3, MAIN_TTL))).toBe('cache  reader 3:20')
+  expect(rowText(mainViewSegments({ a1: idleTrack(0) }, roster, 100_000, 300_000, 3, MAIN_TTL))).toBe('cache  reader 3:20')
+  expect(mainViewSegments({ main: { ...idleTrack(0), inFlight: 1, workingSince: 0 } }, {}, 100_000, 300_000, 3, MAIN_TTL)).toBeUndefined()
+  expect(mainViewSegments({}, {}, 100_000, 300_000, 3, MAIN_TTL)).toBeUndefined()
+  expect(mainViewSegments({ main: idleTrack(NaN) }, {}, 100_000, 300_000, 3, MAIN_TTL)).toBeUndefined()
+})
+
+test('mainViewSegments: the main lifetime is its own, not the agents\'', async () => {
+  const agents = { main: idleTrack(0) }
+  // 100 s in: a 300 s agent lifetime would leave 3:20; the main lifetime of 60 s has run out.
+  expect(rowText(mainViewSegments(agents, {}, 100_000, 300_000, 3, 60_000))).toBe('cache  main expired 0m')
+  expect(rowText(mainViewSegments(agents, {}, 40_000, 3_600_000, 3, 60_000))).toBe('cache  main 0:20')
+})
+
+test('mainViewEntries ignores the main key, even when the roster lists an agent under it', async () => {
+  const agents = { main: idleTrack(0), a1: idleTrack(0) }
+  const roster = { main: { name: 'main', status: 'idle' }, a1: { name: 'one', status: 'idle' } }
+  expect(mainViewEntries(agents, roster, 1000, 300_000).shown.map((e: any) => e.id)).toEqual(['a1'])
+})
+
+test('anyLive counts the main session on its own lifetime', async () => {
+  const agents = { main: idleTrack(0) }
+  expect(anyLive(agents, {}, 100_000, 60_000, MAIN_TTL)).toBe(true)
+  expect(anyLive(agents, {}, 100_000, 300_000, 60_000)).toBe(false)
+  expect(anyLive({ main: { ...idleTrack(0), inFlight: 1, workingSince: 90_000 } }, {}, 100_000, 300_000, 60_000)).toBe(true)
+})
+
+test('prune keeps the main track however old', async () => {
+  const day = 24 * HOUR
+  const agents = { main: idleTrack(0), old: idleTrack(0) }
+  expect(Object.keys(prune(agents, 3 * day))).toEqual(['main'])
+  expect(Object.keys(startRequest(agents, 'a1', 3 * day)).sort()).toEqual(['a1', 'main'])
 })

@@ -1,5 +1,5 @@
 // Cache countdown: how long each subagent's and teammate's prompt cache has
-// left, drawn in the band above the prompt. The main loop is not tracked.
+// left, drawn in the band above the prompt, and the main session's own.
 //
 // Tracking lives in `$.state`, not module variables: a reload (a `/config`
 // change of this plugin's options, or the engine replacing its worker) runs
@@ -12,6 +12,8 @@ import {
   clearInFlight,
   contextTokens,
   endRequest,
+  MAIN_KEY,
+  mainTtlSeconds,
   mainViewSegments,
   rosterFrom,
   sameRoster,
@@ -30,6 +32,8 @@ const TTL_READ_EVERY_MS = 30_000;
 // Roster lookups for ids it does not list (engine forks) run at most this often.
 const ROSTER_LOOKUP_GAP_MS = 2000;
 const UNLISTED_CAP = 500;
+// With nothing live, the main row's only change is its expired age, in whole minutes or more.
+const IDLE_REDRAW_EVERY_TICKS = 60;
 
 // Read at `session.start` and every `TTL_READ_EVERY_MS` after; `session.start` clears them.
 let ttlMs;
@@ -38,6 +42,10 @@ let ttlReading;
 let ticker;
 // Whether the last band render drew a row; an expired track alone does not keep the tick redrawing.
 let lastDrew = false;
+// Whether that row was the main view's, which redraws only once a minute while nothing is live.
+let lastDrewMainView = false;
+// Whether the last tick that checked found something live; the tick that finds nothing redraws once more.
+let wasLive = false;
 // A reload forgets these, which costs one lookup at most.
 let lastRosterAt;
 const unlisted = new Set();
@@ -94,10 +102,13 @@ async function lookUpAgent($, id) {
 async function onTick($, tick, options) {
   const tracked = await read($, agents);
   if (Object.keys(tracked).length === 0) return;
-  if (!lastDrew) {
+  if (!lastDrew || lastDrewMainView) {
     const now = await $.clock.now();
     const ttl = await cacheTtlMs($, options, now);
-    if (!anyLive(tracked, await read($, roster), now, ttl)) return;
+    const isLive = anyLive(tracked, await read($, roster), now, ttl, mainTtlSeconds(options.main_ttl_seconds) * 1000);
+    const redraw = isLive || wasLive || (lastDrew && tick % IDLE_REDRAW_EVERY_TICKS === 0);
+    wasLive = isLive;
+    if (!redraw) return;
   }
   $.ui.invalidate('ui.render');
   if (tick % ROSTER_EVERY_TICKS === 0) {
@@ -120,6 +131,7 @@ export const register = (on, options) => {
       ttlMs = undefined;
       ttlReadAt = undefined;
       lastRosterAt = undefined;
+      wasLive = false;
       unlisted.clear();
       await update($, agents, clearInFlight);
       if (ticker) ticker.cancel();
@@ -135,8 +147,9 @@ export const register = (on, options) => {
   });
 
   on('turn.step', async function* ($, e, next) {
-    const id = e.agentId;
-    if (!id) return yield* next(e);
+    // A request with no agent id is the main loop's, kept under its own key.
+    const isMain = !e.agentId;
+    const id = e.agentId || MAIN_KEY;
     let isCounted = false;
     try {
       // Before the request: the cache's five minutes run from when it was sent.
@@ -159,6 +172,8 @@ export const register = (on, options) => {
         }
       }
     }
+    // The roster does not list the main session.
+    if (isMain) return result;
     // Not awaited: the stream's result goes back without waiting on the roster.
     lookUpAgent($, id).catch(err => quiet($, 'agent.list', err));
     return result;
@@ -191,6 +206,7 @@ export const register = (on, options) => {
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     let row;
     let Box;
+    let isMainView = false;
     try {
       const viewed = e.props.view && e.props.view.agentId;
       if (!e.props.hasSurvey && (viewed || options.main_view !== false)) {
@@ -200,8 +216,9 @@ export const register = (on, options) => {
         const listed = await read($, roster);
         const segments = viewed
           ? viewedAgentSegments(tracked[viewed], now, ttl, listed[viewed]?.status)
-          : mainViewSegments(tracked, listed, now, ttl);
+          : mainViewSegments(tracked, listed, now, ttl, undefined, mainTtlSeconds(options.main_ttl_seconds) * 1000);
         if (segments) {
+          isMainView = !viewed;
           const elements = $.ui.resolve(e);
           Box = elements.Box;
           row = Box({
@@ -217,6 +234,7 @@ export const register = (on, options) => {
       row = undefined;
     }
     lastDrew = Boolean(row);
+    lastDrewMainView = lastDrew && isMainView;
     if (!row) return next(e);
     // Later mods keep their band output under ours.
     const below = await next(e);
